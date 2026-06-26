@@ -1,0 +1,50 @@
+# ============================================================
+# Telegram Summarizer V2 — systemd unit file
+# ============================================================
+# Установка:
+#   sudo cp deploy/tg_summarizer.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable tg_summarizer
+#   sudo systemctl start tg_summarizer
+#
+# ВАЖНО: Перед использованием замените:
+#   - YOUR_USERNAME — на имя пользователя Linux
+#   - /opt/Tg_sum_V2 — на реальный путь к проекту
+# ============================================================
+
+[Unit]
+Description=Telegram Summarizer V2 Bot
+Documentation=https://github.com/your-username/Tg_sum_V2
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+Group=YOUR_USERNAME
+WorkingDirectory=/opt/Tg_sum_V2
+ExecStart=/opt/Tg_sum_V2/.venv/bin/python main.py
+
+# ─── Перезапуск при сбоях ───
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# ─── Переменные окружения ───
+EnvironmentFile=/opt/Tg_sum_V2/.env
+
+# ─── Логирование ───
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=tg_summarizer
+
+# ─── Безопасность ───
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/Tg_sum_V2
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
