@@ -26,6 +26,7 @@ async def auto_fetch_job(bot, user_client):
             chat_id=admin_id,
             user_client=user_client,
             since_last=True,
+            is_background=True,
         )
 
         # 2) Все мониторинговые чаты (#2)
@@ -43,6 +44,7 @@ async def auto_fetch_job(bot, user_client):
                     target_last_msg_id=chat.last_message_id,
                     target_last_run=chat.last_run_timestamp,
                     monitored_chat_db_id=chat.id,
+                    is_background=True,
                 )
             except Exception as e:
                 logger.error(f"Ошибка при обработке чата {chat.chat_peer}: {e}")

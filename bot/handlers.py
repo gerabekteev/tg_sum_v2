@@ -71,6 +71,7 @@ async def process_and_send_summary(
     target_last_msg_id: int = None,
     target_last_run: datetime.datetime = None,
     monitored_chat_db_id: int = None,
+    is_background: bool = False,
 ):
     """
     Основная логика: сбор → дамп → суммаризация → отправка.
@@ -96,14 +97,9 @@ async def process_and_send_summary(
             text="❌ Целевой чат не указан.\n\nНажмите **⚙️ Настройки** → **📝 Изменить чат** для настройки.",
             reply_markup=get_main_keyboard(),
             parse_mode="Markdown",
+            disable_notification=True,
         )
         return
-
-    status_msg = await bot.send_message(
-        chat_id=chat_id,
-        text=f"⏳ Начинаю сбор сообщений из `{chat_target}`...",
-        parse_mode="Markdown",
-    )
 
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     min_id = None
@@ -136,13 +132,13 @@ async def process_and_send_summary(
         )
 
         if not msgs:
-            await bot.edit_message_text(
+            _update_last_run(admin_id, now_utc, monitored_chat_db_id)
+            await bot.send_message(
                 chat_id=chat_id,
-                message_id=status_msg.message_id,
                 text=f"ℹ️ В чате `{chat_target}` не найдено сообщений {period_str}.",
                 parse_mode="Markdown",
+                disable_notification=True,
             )
-            _update_last_run(admin_id, now_utc, monitored_chat_db_id)
             return
 
         # Разделяем на контекстные и целевые
@@ -153,13 +149,13 @@ async def process_and_send_summary(
             (target_messages if is_target else context_messages).append(m)
 
         if not target_messages:
-            await bot.edit_message_text(
+            _update_last_run(admin_id, now_utc, monitored_chat_db_id)
+            await bot.send_message(
                 chat_id=chat_id,
-                message_id=status_msg.message_id,
                 text=f"ℹ️ В чате `{chat_target}` не найдено новых сообщений {period_str}.",
                 parse_mode="Markdown",
+                disable_notification=True,
             )
-            _update_last_run(admin_id, now_utc, monitored_chat_db_id)
             return
 
         # Форматируем тексты
@@ -188,27 +184,15 @@ async def process_and_send_summary(
         max_id = max(m["id"] for m in target_messages)
         _update_last_run(admin_id, now_utc, monitored_chat_db_id, max_id)
 
-        # Отправляем файл дампа
-        caption = (
-            f"✅ **Сбор из** `{chat_target}` **завершен!**\n\n"
-            f"⏱ **Период:** {period_str}\n"
-            f"💬 **Сообщений:** {len(target_messages)}\n"
-            f"📁 `dumps/{filename}`"
-        )
-        await bot.send_document(
-            chat_id=chat_id,
-            document=FSInputFile(str(file_path)),
-            caption=caption,
-            reply_markup=get_main_keyboard(),
-            parse_mode="Markdown",
-        )
-
         # ── Improvement #8: streaming суммаризации ──
-        ai_status_msg = await bot.send_message(
-            chat_id=chat_id,
-            text="⏳ **Генерирую ИИ-саммари (streaming)...**",
-            parse_mode="Markdown",
-        )
+        ai_status_msg = None
+        if not is_background:
+            ai_status_msg = await bot.send_message(
+                chat_id=chat_id,
+                text="⏳ **Генерирую ИИ-саммари (streaming)...**",
+                parse_mode="Markdown",
+                disable_notification=True,
+            )
 
         try:
             t_start = _time.monotonic()
@@ -221,7 +205,7 @@ async def process_and_send_summary(
                 model_used = model
                 # Обновляем сообщение не чаще 1 раза в 1.5 секунды (лимит Telegram)
                 now = _time.monotonic()
-                if now - last_edit_time >= 1.5:
+                if now - last_edit_time >= 1.5 and ai_status_msg:
                     try:
                         display = accumulated_text[:3900] + "..." if len(accumulated_text) > 3900 else accumulated_text
                         await bot.edit_message_text(
@@ -249,16 +233,19 @@ async def process_and_send_summary(
                 log_id = log.id
 
             # Удаляем streaming-сообщение
-            try:
-                await bot.delete_message(chat_id=chat_id, message_id=ai_status_msg.message_id)
-            except Exception:
-                pass
+            if ai_status_msg:
+                try:
+                    await bot.delete_message(chat_id=chat_id, message_id=ai_status_msg.message_id)
+                except Exception:
+                    pass
 
             # Финальное сообщение
             header = f"📊 **ИИ-Саммари переписки ({period_str}):**\n\n"
             stats = f"\n\n*(Проанализировано: {len(target_messages)} сообщ. за {t_elapsed}мс)*"
             footer = f"\n🤖 **Модель:** `{model_used}`"
             full_msg = f"{header}{summary}{stats}{footer}"
+
+            is_important = not ("Нет важной информации" in summary or "🚫" in summary)
 
             qa_keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="💬 Задать вопрос по чату", callback_data=f"ask_qa:{log_id}")]
@@ -267,10 +254,25 @@ async def process_and_send_summary(
             if len(full_msg) > 4096:
                 parts = [full_msg[i:i + 4090] for i in range(0, len(full_msg), 4090)]
                 for part in parts[:-1]:
-                    await bot.send_message(chat_id=chat_id, text=part)
-                await bot.send_message(chat_id=chat_id, text=parts[-1], reply_markup=qa_keyboard)
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=part,
+                        disable_notification=not is_important,
+                    )
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=parts[-1],
+                    reply_markup=qa_keyboard,
+                    disable_notification=not is_important,
+                )
             else:
-                await bot.send_message(chat_id=chat_id, text=full_msg, parse_mode="Markdown", reply_markup=qa_keyboard)
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=full_msg,
+                    parse_mode="Markdown",
+                    reply_markup=qa_keyboard,
+                    disable_notification=not is_important,
+                )
 
         except Exception as ai_err:
             logger.error(f"Streaming failed, fallback to non-stream: {ai_err}")
@@ -289,15 +291,18 @@ async def process_and_send_summary(
                     )
                     log_id = log.id
 
-                try:
-                    await bot.delete_message(chat_id=chat_id, message_id=ai_status_msg.message_id)
-                except Exception:
-                    pass
+                if ai_status_msg:
+                    try:
+                        await bot.delete_message(chat_id=chat_id, message_id=ai_status_msg.message_id)
+                    except Exception:
+                        pass
 
                 header = f"📊 **ИИ-Саммари переписки ({period_str}):**\n\n"
                 stats = f"\n\n*(Проанализировано: {len(target_messages)} сообщ. за {t_elapsed}мс)*"
                 footer = f"\n🤖 **Модель:** `{model_used}`"
                 full_msg = f"{header}{summary}{stats}{footer}"
+
+                is_important = not ("Нет важной информации" in summary or "🚫" in summary)
 
                 qa_keyboard = InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text="💬 Задать вопрос по чату", callback_data=f"ask_qa:{log_id}")]
@@ -306,34 +311,48 @@ async def process_and_send_summary(
                 if len(full_msg) > 4096:
                     parts = [full_msg[i:i + 4090] for i in range(0, len(full_msg), 4090)]
                     for part in parts[:-1]:
-                        await bot.send_message(chat_id=chat_id, text=part)
-                    await bot.send_message(chat_id=chat_id, text=parts[-1], reply_markup=qa_keyboard)
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=part,
+                            disable_notification=not is_important,
+                        )
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=parts[-1],
+                        reply_markup=qa_keyboard,
+                        disable_notification=not is_important,
+                    )
                 else:
-                    await bot.send_message(chat_id=chat_id, text=full_msg, parse_mode="Markdown", reply_markup=qa_keyboard)
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=full_msg,
+                        parse_mode="Markdown",
+                        reply_markup=qa_keyboard,
+                        disable_notification=not is_important,
+                    )
 
             except Exception as fallback_err:
                 logger.error(f"Не удалось сгенерировать саммари: {fallback_err}")
-                try:
-                    await bot.delete_message(chat_id=chat_id, message_id=ai_status_msg.message_id)
-                except Exception:
-                    pass
+                if ai_status_msg:
+                    try:
+                        await bot.delete_message(chat_id=chat_id, message_id=ai_status_msg.message_id)
+                    except Exception:
+                        pass
                 await bot.send_message(
                     chat_id=chat_id,
                     text=f"⚠️ **Не удалось сгенерировать ИИ-саммари:**\n`{str(fallback_err)}`",
                     parse_mode="Markdown",
+                    disable_notification=True,
                 )
 
     except Exception as e:
         logger.exception("Ошибка во время сбора сообщений")
-        try:
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=status_msg.message_id,
-                text=f"❌ Ошибка при сборе:\n`{str(e)}`",
-                parse_mode="Markdown",
-            )
-        except Exception:
-            await bot.send_message(chat_id=chat_id, text=f"❌ Ошибка при сборе:\n`{str(e)}`", parse_mode="Markdown")
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"❌ Ошибка при сборе:\n`{str(e)}`",
+            parse_mode="Markdown",
+            disable_notification=True,
+        )
 
 
 def _format_messages(messages: list[dict]) -> str:
